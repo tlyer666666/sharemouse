@@ -1,0 +1,10 @@
+/src-tauri/target/
+/src-tauri/gen/
+/dist/
+*.log
+.DS_Store
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+Thumbs.db
