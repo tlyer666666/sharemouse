@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DeskBridge</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <nav class="app-navbar" aria-label="DeskBridge 导航">
+        <div class="nav-inner">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true">
+              <span></span><span></span>
+            </div>
+            <div>
+              <strong>DeskBridge</strong>
+              <small>LOCAL INPUT SHARING</small>
+            </div>
+          </div>
+
+          <div class="nav-menu" aria-label="应用导航">
+            <button class="nav-item active" data-scroll="overview">
+              <span class="nav-icon" aria-hidden="true">⌂</span>控制面板
+            </button>
+            <button class="nav-item" data-scroll="devices">
+              <span class="nav-icon" aria-hidden="true">⌁</span>设备与布局
+            </button>
+            <button class="nav-item" data-scroll="security">
+              <span class="nav-icon" aria-hidden="true">◇</span>安全与权限
+            </button>
+          </div>
+
+          <div class="nav-meta">
+            <span class="privacy-dot"></span>
+            <span>仅局域网</span>
+            <b id="platformLabel">—</b>
+            <b id="versionLabel">v0.1.0</b>
+          </div>
+        </div>
+      </nav>
+
+      <main>
+        <header class="topbar" id="overview">
+          <div>
+            <p class="eyebrow">控制面板</p>
+            <h1>一套键鼠，两台电脑</h1>
+            <p class="topbar-note">像跨显示器一样，在 Windows 与 macOS 之间自然切换。</p>
+          </div>
+          <label class="master-switch">
+            <span>
+              <strong id="switchTitle">共享已暂停</strong>
+              <small id="switchSubtitle">开启后才会发送或接收输入</small>
+            </span>
+            <input id="enabledToggle" type="checkbox" role="switch" />
+            <i aria-hidden="true"></i>
+          </label>
+        </header>
+
+        <section class="status-card" aria-live="polite" aria-atomic="true">
+          <div class="status-main">
+            <div class="status-orb" id="statusOrb"><span></span></div>
+            <div>
+              <div class="status-line">
+                <span class="state-pill" id="statePill">正在启动</span>
+                <span class="latency" id="latencyLabel"></span>
+              </div>
+              <h2 id="statusMessage">正在读取本机状态…</h2>
+              <p id="statusDetail">两台电脑需连接到同一个 Wi‑Fi 或有线局域网。</p>
+            </div>
+          </div>
+          <button class="secondary danger-soft" id="returnButton">⌨ 立即返回本机</button>
+        </section>
+
+        <section class="quick-stats" aria-label="连接摘要">
+          <article class="stat-card">
+            <span class="stat-icon stat-icon-blue" aria-hidden="true">⌁</span>
+            <div><strong id="onlineCount">0</strong><small>在线设备</small></div>
+          </article>
+          <article class="stat-card">
+            <span class="stat-icon stat-icon-green" aria-hidden="true">✓</span>
+            <div><strong id="securityState">已加密</strong><small>本地安全连接</small></div>
+          </article>
+          <article class="stat-card">
+            <span class="stat-icon stat-icon-violet" aria-hidden="true">↔</span>
+            <div><strong id="edgeSummary">向右切换</strong><small>当前屏幕布局</small></div>
+          </article>
+        </section>
+
+        <section class="device-stage" id="devices">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">屏幕布局</p>
+              <h2>另一台电脑在哪一侧？</h2>
+            </div>
+            <div class="edge-selector" role="group" aria-label="对方电脑位置">
+              <button data-edge="left" aria-pressed="false">在左侧</button>
+              <button data-edge="right" class="selected" aria-pressed="true">在右侧</button>
+            </div>
+          </div>
+
+          <div class="screen-layout" id="screenLayout">
+            <article class="computer peer-computer" id="peerComputer">
+              <div class="screen">
+                <span class="os-badge" id="peerOs">对端</span>
+                <strong id="peerScreenName">选择一台设备</strong>
+                <small id="peerAddress">等待发现</small>
+              </div>
+              <div class="stand"></div>
+            </article>
+            <div class="bridge-line"><span>移动到边缘</span></div>
+            <article class="computer local-computer">
+              <div class="screen">
+                <span class="os-badge">本机</span>
+                <strong id="localScreenName">这台电脑</strong>
+                <small>键盘与鼠标已连接</small>
+              </div>
+              <div class="stand"></div>
+            </article>
+          </div>
+
+          <p class="layout-hint" id="layoutHint">持续把鼠标推向右侧边缘约 180 ms 后切换；四角保留防误触区。</p>
+        </section>
+
+        <div class="content-grid">
+          <section class="panel device-panel">
+            <div class="panel-title">
+              <div>
+                <p class="eyebrow">自动发现</p>
+                <h2>局域网设备</h2>
+              </div>
+              <span class="scan-indicator" id="scanIndicator"><i></i>扫描中</span>
+            </div>
+            <div class="peer-list" id="peerList">
+              <div class="empty-state">
+                <div class="radar"><i></i></div>
+                <strong>正在寻找 DeskBridge 设备</strong>
+                <p>请在另一台电脑上打开 DeskBridge。</p>
+              </div>
+            </div>
+            <div class="manual-row">
+              <label for="manualAddress">找不到设备？输入 IP 或主机名</label>
+              <input id="manualAddress" placeholder="例如 192.168.1.28" autocomplete="off" />
+            </div>
+          </section>
+
+          <section class="panel settings-panel">
+            <div class="panel-title">
+              <div>
+                <p class="eyebrow">切换手感</p>
+                <h2>边缘推动时间</h2>
+              </div>
+              <output id="delayOutput">180 ms</output>
+            </div>
+            <input id="edgeDelay" class="range" type="range" min="80" max="600" step="20" value="180" aria-label="边缘推动时间" />
+            <div class="range-labels"><span>灵敏</span><span>不易误触</span></div>
+            <div class="hotkey-card">
+              <div>
+                <span class="hotkey-icon">↩</span>
+                <div>
+                  <strong>紧急返回</strong>
+                  <small>该快捷键永远只在本机处理</small>
+                </div>
+              </div>
+              <kbd id="hotkeyLabel">Ctrl + Alt + Shift + Esc</kbd>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel security-panel" id="security">
+          <div class="panel-title">
+            <div>
+              <p class="eyebrow">端到端加密</p>
+              <h2>配对密钥与系统权限</h2>
+            </div>
+            <span class="secure-badge">ChaCha20‑Poly1305</span>
+          </div>
+          <div class="security-grid">
+            <div class="field-block">
+              <label for="pairingKey">两台电脑使用同一个配对密钥</label>
+              <div class="key-field">
+                <input id="pairingKey" type="password" spellcheck="false" autocomplete="off" />
+                <button id="revealKey" class="icon-button" aria-label="显示密钥" aria-pressed="false">◎</button>
+                <button id="copyKey" class="icon-button" aria-label="复制密钥">⧉</button>
+              </div>
+              <div class="field-actions">
+                <button class="text-button" id="generateKey">重置配对</button>
+                <span>复制任意一台的现有密钥，粘贴到另一台。</span>
+              </div>
+            </div>
+            <div class="permission-card" id="permissionCard">
+              <div class="permission-icon">✓</div>
+              <div>
+                <strong id="permissionTitle">正在检查系统权限</strong>
+                <p id="permissionMessage">—</p>
+              </div>
+              <button class="secondary" id="permissionButton">重新检测</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel identity-panel">
+          <div>
+            <label for="deviceName">本机显示名称</label>
+            <input id="deviceName" maxlength="48" />
+          </div>
+          <div class="save-group">
+            <span id="saveHint">修改后需要保存</span>
+            <button class="primary" id="saveButton">保存并开启</button>
+          </div>
+        </section>
+
+        <footer>
+          <span>MIT 开源 · 无账号 · 无云服务 · 不采集输入内容</span>
+          <span>TCP 24817 · UDP 24816</span>
+        </footer>
+      </main>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

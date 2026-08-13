@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: DeskBridge-Windows-x64
+          - os: macos-14
+            artifact: DeskBridge-macOS-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Prepare Windows asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item dist/windows/DeskBridge.exe "${{ matrix.artifact }}.exe"
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash scripts/build-macos.sh
+      - name: Prepare macOS asset
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ditto -c -k --sequesterRsrc --keepParent src-tauri/target/release/bundle/macos/DeskBridge.app "${{ matrix.artifact }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: DeskBridge-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Add checksums
+        working-directory: release-assets
+        run: sha256sum DeskBridge-* > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0' }}
+          name: DeskBridge ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0' }}
+          target_commitish: ${{ github.sha }}
+          body_path: RELEASE_NOTES.md
+          files: release-assets/*
+          fail_on_unmatched_files: true
