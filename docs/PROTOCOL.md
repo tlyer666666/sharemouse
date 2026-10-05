@@ -1,6 +1,6 @@
 # DeskBridge v1 protocol
 
-本文档描述当前 MVP 的线上格式和失败处理。实现以 `src-tauri/src/protocol.rs` 为准。
+本文档描述 DeskBridge v1 协议的传输格式和失败处理。实现以 `src-tauri/src/protocol.rs` 为准。
 
 ## 发现
 
@@ -35,7 +35,7 @@ magic[8] | version[2] | client_id[32 ASCII] | client_nonce[32] | HMAC-SHA256[32]
 magic[8] | version[2] | server_id[32 ASCII] | server_nonce[32] | HMAC-SHA256[32]
 ```
 
-服务端 HMAC 额外绑定客户端 nonce，阻止反射旧响应。双方以配对密钥和两个随机 nonce 通过 HKDF-SHA256 分别派生 `client → server` 与 `server → client` 两把 256 位密钥。
+服务端 HMAC 还会覆盖客户端 nonce，因此旧的响应无法被重放。双方以配对密钥和两个随机 nonce 通过 HKDF-SHA256 分别派生 `client → server` 与 `server → client` 两把 256 位密钥。
 
 配对密钥是高熵预共享密钥，不是可离线穷举的六位 PIN。
 
@@ -81,7 +81,7 @@ Idle → edge dwell → Connecting → RemoteActive → Returning → Idle
                            └─ failure ───┴─ disconnect → ReleaseAll → Idle
 ```
 
-接收端只有在完成认证、本机共享总开关开启、对端 ID 符合选择项且输入注入权限可用时接受 `Activate`。一次只允许一个接收会话。
+接收端只有在完成认证、本机共享开关已打开、对端身份与已选设备一致且输入注入权限可用时才接受 `Activate`。一次只允许一个接收会话。
 
 发送端收到 `ActivateAck` 后才开始抑制和转发本机输入。接收端在入口边缘检测到向外移动时发送 `ReturnControl`。任何失败路径都执行 `ReleaseAll`。
 
@@ -95,4 +95,4 @@ Idle → edge dwell → Connecting → RemoteActive → Returning → Idle
 - Windows UAC / secure desktop 或 macOS Secure Input
 - 首次人工复制密钥时所使用通道的泄露
 
-正式发行版还应把长期密钥放入 DPAPI / Credential Manager 和 macOS Keychain，并加入双端 SAS 确认及 pinned device identity。
+后续正式版本还应把配对密钥存入 DPAPI / Credential Manager 与 macOS 钥匙串，并加入双端 SAS 确认和固定设备身份。
