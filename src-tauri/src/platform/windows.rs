@@ -366,7 +366,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, w_param: usize, l_param: isiz
         return 1;
     }
     let Some(usage) = usage else {
-        return CallNextHookEx(null_mut(), code, w_param, l_param);
+        return 1;
     };
     send_event(
         context,

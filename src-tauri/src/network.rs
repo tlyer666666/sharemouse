@@ -164,7 +164,7 @@ impl Service {
                 None,
                 None,
             );
-        } else {
+        } else if !session_state_in_progress(&self.status) {
             set_status(
                 &self.status,
                 "searching",
@@ -824,6 +824,17 @@ fn set_ready_status(status: &Arc<RwLock<RuntimeStatus>>, control: &CaptureContro
     }
 }
 
+fn session_state_in_progress(status: &Arc<RwLock<RuntimeStatus>>) -> bool {
+    status
+        .read()
+        .map(|status| is_session_state(&status.state))
+        .unwrap_or(false)
+}
+
+fn is_session_state(state: &str) -> bool {
+    matches!(state, "connecting" | "controlling" | "controlled")
+}
+
 struct Target {
     address: SocketAddr,
     expected_id: Option<String>,
@@ -1293,5 +1304,16 @@ mod tests {
         assert!(is_lan_ip("127.0.0.1".parse().unwrap()));
         assert!(!is_lan_ip("8.8.8.8".parse().unwrap()));
         assert!(!is_lan_ip("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[test]
+    fn active_sessions_are_not_reported_as_idle_states() {
+        assert!(is_session_state("connecting"));
+        assert!(is_session_state("controlling"));
+        assert!(is_session_state("controlled"));
+        assert!(!is_session_state("searching"));
+        assert!(!is_session_state("ready"));
+        assert!(!is_session_state("paused"));
+        assert!(!is_session_state("error"));
     }
 }
