@@ -27,6 +27,6 @@
   <key>NSLocalNetworkUsageDescription</key>
   <string>DeskBridge 只使用本地网络发现并连接你选择的另一台电脑。</string>
   <key>NSHumanReadableCopyright</key>
-  <string>DeskBridge is an independent local-input-sharing project.</string>
+  <string>Copyright (c) 2026 DeskBridge contributors</string>
 </dict>
 </plist>
