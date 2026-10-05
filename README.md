@@ -4,11 +4,9 @@
 
 DeskBridge is a lightweight local mouse/keyboard sharing app for Windows and macOS on the same LAN.
 
-- Local discovery on UDP
-- Edge-triggered switching by default
-- Encrypted pairing with HMAC-SHA256 + ChaCha20-Poly1305
-- Auto emergency key release + heartbeat timeouts
-- No cloud login, no account, no keyboard data collection
+- UDP discovery on the LAN, with a manual IP fallback; no account, no cloud service, no telemetry
+- Edge-triggered switching between two computers, left or right, plus an emergency return hotkey
+- Pairing with a 256-bit key: HMAC-SHA256 handshake and ChaCha20-Poly1305 frames; input is released on disconnect or timeout
 
 ## Download
 
@@ -53,6 +51,15 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --release
 ```
 
+## Limitations
+
+- Windows and macOS only, two computers, left/right layout.
+- No clipboard, file transfer, system tray icon or login item yet.
+- Windows: elevated windows, the UAC secure desktop and the lock screen are out of reach.
+- macOS: Secure Input and the login window are out of reach.
+- The pairing key is kept in a plaintext settings file, not in the OS keychain yet.
+- Release binaries are unsigned: the macOS build is ad-hoc signed and the Windows build is not code-signed.
+
 ## Protocol
 
 See [docs/PROTOCOL.md](docs/PROTOCOL.md)
@@ -74,3 +81,5 @@ DeskBridge/
 ## Licensing
 
 Licensed under the MIT license. See [LICENSE](LICENSE).
+
+DeskBridge is an independent implementation and is not affiliated with ShareMouse, Synergy, Deskflow or Input Leap.
