@@ -142,6 +142,14 @@ fn accept_advertisement(
         seen_at: Instant::now(),
     };
     if let Ok(mut table) = peers.write() {
+        // 同一地址在现有记录过期前不接受其他节点认领，防止伪造广播挤掉真实设备。
+        if table.iter().any(|(node_id, existing)| {
+            node_id != &advertisement.node_id
+                && existing.address == peer.address
+                && existing.seen_at.elapsed() < PEER_EXPIRY
+        }) {
+            return;
+        }
         table.retain(|node_id, existing| {
             node_id == &advertisement.node_id || existing.address != peer.address
         });
@@ -232,5 +240,31 @@ mod tests {
             &peers,
         );
         assert!(peers.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fresh_address_binding_rejects_other_node_ids() {
+        let settings = Arc::new(RwLock::new(Settings::default()));
+        let peers = Arc::new(RwLock::new(HashMap::new()));
+        let source = "10.0.0.5:24816".parse().unwrap();
+        accept_advertisement(advertisement(1), source, &settings, &peers);
+        accept_advertisement(advertisement(2), source, &settings, &peers);
+        let table = peers.read().unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key(&format!("{:032x}", 1usize)));
+        drop(table);
+
+        let backdated = Instant::now()
+            .checked_sub(PEER_EXPIRY + Duration::from_secs(1))
+            .unwrap();
+        if let Ok(mut table) = peers.write() {
+            for peer in table.values_mut() {
+                peer.seen_at = backdated;
+            }
+        }
+        accept_advertisement(advertisement(2), source, &settings, &peers);
+        let table = peers.read().unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key(&format!("{:032x}", 2usize)));
     }
 }

@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（须已推送到仓库，如 v0.1.0）"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -61,8 +66,8 @@ jobs:
         run: sha256sum DeskBridge-* > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0' }}
-          name: DeskBridge ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0' }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          name: DeskBridge ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
           target_commitish: ${{ github.sha }}
           body_path: RELEASE_NOTES.md
           files: release-assets/*

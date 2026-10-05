@@ -107,6 +107,11 @@ unsafe extern "C" {
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> u32;
     fn CGPreflightListenEventAccess() -> bool;
     fn CGRequestListenEventAccess() -> bool;
     fn AXIsProcessTrusted() -> bool;
@@ -324,7 +329,7 @@ unsafe extern "C" fn event_callback(
             return null_mut();
         }
         let Some(usage) = usage else {
-            return event;
+            return null_mut();
         };
         send_event(
             context,
@@ -447,7 +452,7 @@ fn reset_capture_state(state: &mut HookState) {
 
 fn on_activation_edge(context: &HookContext, point: CGPoint) -> bool {
     let edge = Edge::from_u8(context.control.edge.load(Ordering::Acquire));
-    let bounds = main_display_bounds();
+    let bounds = virtual_desktop_bounds();
     let at_edge = match edge {
         Edge::Left => point.x <= bounds.origin.x + 1.0,
         Edge::Right => point.x >= bounds.origin.x + bounds.size.width - 2.0,
@@ -460,7 +465,7 @@ fn on_activation_edge(context: &HookContext, point: CGPoint) -> bool {
 
 fn watch_edge(context: &HookContext, state: &mut HookState, point: CGPoint) {
     let edge = Edge::from_u8(context.control.edge.load(Ordering::Acquire));
-    let bounds = main_display_bounds();
+    let bounds = virtual_desktop_bounds();
     let at_edge = match edge {
         Edge::Left => point.x <= bounds.origin.x + 1.0,
         Edge::Right => point.x >= bounds.origin.x + bounds.size.width - 2.0,
@@ -501,7 +506,7 @@ fn send_event(context: &HookContext, event: CaptureEvent) {
 
 pub fn inject_mouse_move(dx: i32, dy: i32) -> Result<(), String> {
     let current = current_pointer()?;
-    let bounds = main_display_bounds();
+    let bounds = virtual_desktop_bounds();
     let target = CGPoint {
         x: (current.x + f64::from(dx))
             .clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0),
@@ -599,7 +604,7 @@ fn current_pointer() -> Result<CGPoint, String> {
 }
 
 pub fn place_pointer(edge: Edge) -> Result<(), String> {
-    let bounds = main_display_bounds();
+    let bounds = virtual_desktop_bounds();
     let current = current_pointer().unwrap_or(CGPoint {
         x: bounds.origin.x + bounds.size.width / 2.0,
         y: bounds.origin.y + bounds.size.height / 2.0,
@@ -628,7 +633,7 @@ pub fn restore_local_pointer(edge: Edge) -> Result<(), String> {
 
 pub fn pointer_at_edge(edge: Edge) -> Result<bool, String> {
     let point = current_pointer()?;
-    let bounds = main_display_bounds();
+    let bounds = virtual_desktop_bounds();
     Ok(match edge {
         Edge::Left => point.x <= bounds.origin.x + 1.0,
         Edge::Right => point.x >= bounds.origin.x + bounds.size.width - 2.0,
@@ -664,8 +669,35 @@ pub fn request_permissions() -> PermissionState {
     permission_state()
 }
 
-fn main_display_bounds() -> CGRect {
-    unsafe { CGDisplayBounds(CGMainDisplayID()) }
+fn virtual_desktop_bounds() -> CGRect {
+    unsafe {
+        let mut displays = [0_u32; 16];
+        let mut count: u32 = 0;
+        if CGGetActiveDisplayList(displays.len() as u32, displays.as_mut_ptr(), &mut count) == 0
+            && count > 0
+        {
+            let count = count.min(displays.len() as u32) as usize;
+            let mut bounds = CGDisplayBounds(displays[0]);
+            for &display in &displays[1..count] {
+                let frame = CGDisplayBounds(display);
+                let min_x = bounds.origin.x.min(frame.origin.x);
+                let min_y = bounds.origin.y.min(frame.origin.y);
+                let max_x =
+                    (bounds.origin.x + bounds.size.width).max(frame.origin.x + frame.size.width);
+                let max_y =
+                    (bounds.origin.y + bounds.size.height).max(frame.origin.y + frame.size.height);
+                bounds = CGRect {
+                    origin: CGPoint { x: min_x, y: min_y },
+                    size: CGSize {
+                        width: max_x - min_x,
+                        height: max_y - min_y,
+                    },
+                };
+            }
+            return bounds;
+        }
+        CGDisplayBounds(CGMainDisplayID())
+    }
 }
 
 fn has_emergency_modifiers(modifiers: &HashSet<u16>) -> bool {
