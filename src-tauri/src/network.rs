@@ -933,7 +933,9 @@ impl IncomingRegistry {
             .iter()
             .position(|attempt| attempt.id == attempt_id)?;
         let promoted = self.preauth.swap_remove(index);
-        self.active.replace(promoted).map(|previous| previous.thread)
+        self.active
+            .replace(promoted)
+            .map(|previous| previous.thread)
     }
 }
 

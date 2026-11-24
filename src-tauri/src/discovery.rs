@@ -146,9 +146,9 @@ fn accept_advertisement(
         return;
     }
 
-    let authenticated = pairing_key.as_ref().is_some_and(|key| {
-        verify_advertisement_auth(&advertisement, key, unix_time_secs())
-    });
+    let authenticated = pairing_key
+        .as_ref()
+        .is_some_and(|key| verify_advertisement_auth(&advertisement, key, unix_time_secs()));
 
     let peer = PeerInfo {
         node_id: advertisement.node_id.clone(),
@@ -212,7 +212,11 @@ fn discovery_auth_payload(
     payload
 }
 
-fn sign_advertisement(advertisement: &mut Advertisement, pairing_key: &[u8; 32], timestamp_sec: u64) {
+fn sign_advertisement(
+    advertisement: &mut Advertisement,
+    pairing_key: &[u8; 32],
+    timestamp_sec: u64,
+) {
     let payload = discovery_auth_payload(
         advertisement.version,
         &advertisement.node_id,
@@ -237,9 +241,10 @@ fn verify_advertisement_auth(
     pairing_key: &[u8; 32],
     now_sec: u64,
 ) -> bool {
-    let (Some(timestamp_sec), Some(tag_hex)) =
-        (advertisement.timestamp_sec, advertisement.auth_tag.as_deref())
-    else {
+    let (Some(timestamp_sec), Some(tag_hex)) = (
+        advertisement.timestamp_sec,
+        advertisement.auth_tag.as_deref(),
+    ) else {
         return false;
     };
     if now_sec.abs_diff(timestamp_sec) > AUTH_TIME_WINDOW_SECS {
@@ -413,7 +418,12 @@ mod tests {
 
         let mut initial = advertisement(1);
         sign_advertisement(&mut initial, &key, unix_time_secs());
-        accept_advertisement(initial, "10.0.0.5:24816".parse().unwrap(), &settings, &peers);
+        accept_advertisement(
+            initial,
+            "10.0.0.5:24816".parse().unwrap(),
+            &settings,
+            &peers,
+        );
 
         // Stale timestamp must not authenticate or overwrite IP.
         let mut stale = advertisement(1);
@@ -424,7 +434,12 @@ mod tests {
         );
         accept_advertisement(stale, "10.0.0.6:24816".parse().unwrap(), &settings, &peers);
         assert_eq!(
-            peers.read().unwrap().get(&format!("{:032x}", 1usize)).unwrap().address,
+            peers
+                .read()
+                .unwrap()
+                .get(&format!("{:032x}", 1usize))
+                .unwrap()
+                .address,
             "10.0.0.5"
         );
 
@@ -438,7 +453,12 @@ mod tests {
             &peers,
         );
         assert_eq!(
-            peers.read().unwrap().get(&format!("{:032x}", 1usize)).unwrap().address,
+            peers
+                .read()
+                .unwrap()
+                .get(&format!("{:032x}", 1usize))
+                .unwrap()
+                .address,
             "10.0.0.5"
         );
 
@@ -447,7 +467,12 @@ mod tests {
         sign_advertisement(&mut moved, &key, unix_time_secs());
         accept_advertisement(moved, "10.0.0.8:24816".parse().unwrap(), &settings, &peers);
         assert_eq!(
-            peers.read().unwrap().get(&format!("{:032x}", 1usize)).unwrap().address,
+            peers
+                .read()
+                .unwrap()
+                .get(&format!("{:032x}", 1usize))
+                .unwrap()
+                .address,
             "10.0.0.8"
         );
     }

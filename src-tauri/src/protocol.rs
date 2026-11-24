@@ -229,9 +229,8 @@ pub fn client_handshake(
     let auth_key = hmac::Key::new(hmac::HMAC_SHA256, pairing_key);
     let mut client_hello = Vec::with_capacity(HELLO_SIZE);
     client_hello.extend_from_slice(&client_body);
-    client_hello.extend_from_slice(
-        hmac::sign(&auth_key, &client_hello_mac_input(&client_body)).as_ref(),
-    );
+    client_hello
+        .extend_from_slice(hmac::sign(&auth_key, &client_hello_mac_input(&client_body)).as_ref());
     write_all_until(&mut stream, &client_hello, Instant::now() + WRITE_DEADLINE)?;
 
     let mut server_hello = [0_u8; HELLO_SIZE];
@@ -326,7 +325,11 @@ pub fn server_handshake(
     let mut response = Vec::with_capacity(HELLO_SIZE);
     response.extend_from_slice(&server_body);
     response.extend_from_slice(
-        hmac::sign(&auth_key, &server_hello_mac_input(&client_body, &server_body)).as_ref(),
+        hmac::sign(
+            &auth_key,
+            &server_hello_mac_input(&client_body, &server_body),
+        )
+        .as_ref(),
     );
     write_all_until(
         &mut stream,
@@ -372,10 +375,9 @@ pub fn server_handshake(
     })
 }
 
-fn verify_client_hello(
-    hello: &[u8; HELLO_SIZE],
-    auth_key: &hmac::Key,
-) -> io::Result<(String, [u8; 32], [u8; 32], [u8; 32])> {
+type ParsedHello = (String, [u8; 32], [u8; 32], [u8; 32]);
+
+fn verify_client_hello(hello: &[u8; HELLO_SIZE], auth_key: &hmac::Key) -> io::Result<ParsedHello> {
     verify_common_header(hello)?;
     let body: &[u8; HELLO_BODY_SIZE] = hello[..HELLO_BODY_SIZE].try_into().unwrap();
     let mac_input = client_hello_mac_input(body);
@@ -388,7 +390,7 @@ fn verify_server_hello(
     hello: &[u8; HELLO_SIZE],
     client_body: &[u8; HELLO_BODY_SIZE],
     auth_key: &hmac::Key,
-) -> io::Result<(String, [u8; 32], [u8; 32], [u8; 32])> {
+) -> io::Result<ParsedHello> {
     verify_common_header(hello)?;
     let server_body: &[u8; HELLO_BODY_SIZE] = hello[..HELLO_BODY_SIZE].try_into().unwrap();
     let mac_input = server_hello_mac_input(client_body, server_body);
