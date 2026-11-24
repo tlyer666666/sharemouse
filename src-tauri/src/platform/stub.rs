@@ -29,6 +29,8 @@ pub fn inject_key(_usage: u16, _down: bool) -> Result<(), String> {
     Err("当前平台不支持输入注入".into())
 }
 
+pub fn reset_injected_state() {}
+
 pub fn place_pointer(_edge: Edge) -> Result<(), String> {
     Ok(())
 }

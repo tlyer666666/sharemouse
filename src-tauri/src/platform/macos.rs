@@ -46,6 +46,10 @@ const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
 const KCG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
 const KCG_EVENT_SOURCE_STATE_COMBINED_SESSION: i32 = 0;
 const KCG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
+const KCG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
+const KCG_EVENT_FLAG_MASK_CONTROL: u64 = 0x0004_0000;
+const KCG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
+const KCG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 const INJECTION_SENTINEL: i64 = 0x4453_4B42;
 
 #[repr(C)]
@@ -87,6 +91,7 @@ unsafe extern "C" {
     fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
     fn CGEventSourceKeyState(state_id: i32, virtual_key: u16) -> bool;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventCreate(source: *mut c_void) -> CGEventRef;
     fn CGEventCreateMouseEvent(
         source: *mut c_void,
@@ -150,6 +155,7 @@ struct HookState {
 static CONTEXT: OnceLock<HookContext> = OnceLock::new();
 static EVENT_TAP: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static INJECTED_BUTTONS: AtomicU8 = AtomicU8::new(0);
+static INJECTED_MODIFIERS: AtomicU8 = AtomicU8::new(0);
 
 pub fn spawn_capture(
     sender: SyncSender<CaptureEvent>,
@@ -390,16 +396,20 @@ fn mouse_message(kind: u32, event: CGEventRef) -> Option<WireMessage> {
                 button: 2,
                 down: false,
             }),
-            KCG_EVENT_OTHER_MOUSE_DOWN => Some(WireMessage::MouseButton {
-                button: (CGEventGetIntegerValueField(event, KCG_MOUSE_EVENT_BUTTON_NUMBER) + 1)
-                    as u8,
-                down: true,
-            }),
-            KCG_EVENT_OTHER_MOUSE_UP => Some(WireMessage::MouseButton {
-                button: (CGEventGetIntegerValueField(event, KCG_MOUSE_EVENT_BUTTON_NUMBER) + 1)
-                    as u8,
-                down: false,
-            }),
+            KCG_EVENT_OTHER_MOUSE_DOWN => {
+                let raw = CGEventGetIntegerValueField(event, KCG_MOUSE_EVENT_BUTTON_NUMBER) + 1;
+                (1..=5).contains(&raw).then_some(WireMessage::MouseButton {
+                    button: raw as u8,
+                    down: true,
+                })
+            }
+            KCG_EVENT_OTHER_MOUSE_UP => {
+                let raw = CGEventGetIntegerValueField(event, KCG_MOUSE_EVENT_BUTTON_NUMBER) + 1;
+                (1..=5).contains(&raw).then_some(WireMessage::MouseButton {
+                    button: raw as u8,
+                    down: false,
+                })
+            }
             KCG_EVENT_SCROLL_WHEEL => Some(WireMessage::Wheel {
                 horizontal: CGEventGetIntegerValueField(event, KCG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
                     as i32,
@@ -504,14 +514,59 @@ fn send_event(context: &HookContext, event: CaptureEvent) {
     try_send_capture(&context.sender, &context.control, event);
 }
 
+fn safe_clamp_f64(value: f64, min: f64, max: f64) -> f64 {
+    if !min.is_finite() {
+        return 0.0;
+    }
+    if !max.is_finite() || min > max {
+        return min;
+    }
+    if !value.is_finite() {
+        return min;
+    }
+    value.clamp(min, max)
+}
+
+fn modifier_bit(usage: u16) -> Option<u8> {
+    (0xE0..=0xE7)
+        .contains(&usage)
+        .then(|| 1_u8 << (usage - 0xE0))
+}
+
+fn cg_flags_from_modifiers(mods: u8) -> u64 {
+    let mut flags = 0_u64;
+    if mods & ((1 << 0) | (1 << 4)) != 0 {
+        flags |= KCG_EVENT_FLAG_MASK_CONTROL;
+    }
+    if mods & ((1 << 1) | (1 << 5)) != 0 {
+        flags |= KCG_EVENT_FLAG_MASK_SHIFT;
+    }
+    if mods & ((1 << 2) | (1 << 6)) != 0 {
+        flags |= KCG_EVENT_FLAG_MASK_ALTERNATE;
+    }
+    if mods & ((1 << 3) | (1 << 7)) != 0 {
+        flags |= KCG_EVENT_FLAG_MASK_COMMAND;
+    }
+    flags
+}
+
+fn injected_modifier_flags() -> u64 {
+    cg_flags_from_modifiers(INJECTED_MODIFIERS.load(Ordering::Acquire))
+}
+
+pub fn reset_injected_state() {
+    INJECTED_BUTTONS.store(0, Ordering::Release);
+    INJECTED_MODIFIERS.store(0, Ordering::Release);
+}
+
 pub fn inject_mouse_move(dx: i32, dy: i32) -> Result<(), String> {
     let current = current_pointer()?;
     let bounds = virtual_desktop_bounds();
+    let max_x = (bounds.origin.x + (bounds.size.width - 1.0).max(0.0)).max(bounds.origin.x);
+    let max_y = (bounds.origin.y + (bounds.size.height - 1.0).max(0.0)).max(bounds.origin.y);
     let target = CGPoint {
-        x: (current.x + f64::from(dx))
-            .clamp(bounds.origin.x, bounds.origin.x + bounds.size.width - 1.0),
-        y: (current.y + f64::from(dy))
-            .clamp(bounds.origin.y, bounds.origin.y + bounds.size.height - 1.0),
+        x: safe_clamp_f64(current.x + f64::from(dx), bounds.origin.x, max_x),
+        y: safe_clamp_f64(current.y + f64::from(dy), bounds.origin.y, max_y),
     };
     let buttons = INJECTED_BUTTONS.load(Ordering::Acquire);
     let (kind, button) = if buttons & 1 != 0 {
@@ -523,10 +578,16 @@ pub fn inject_mouse_move(dx: i32, dy: i32) -> Result<(), String> {
     } else {
         (KCG_EVENT_MOUSE_MOVED, 0)
     };
-    post_event(unsafe { CGEventCreateMouseEvent(null_mut(), kind, target, button) })
+    post_event_with_flags(
+        unsafe { CGEventCreateMouseEvent(null_mut(), kind, target, button) },
+        injected_modifier_flags(),
+    )
 }
 
 pub fn inject_mouse_button(button: u8, down: bool) -> Result<(), String> {
+    if !(1..=5).contains(&button) {
+        return Ok(());
+    }
     let (kind, cg_button) = match (button, down) {
         (1, true) => (KCG_EVENT_LEFT_MOUSE_DOWN, 0),
         (1, false) => (KCG_EVENT_LEFT_MOUSE_UP, 0),
@@ -544,9 +605,10 @@ pub fn inject_mouse_button(button: u8, down: bool) -> Result<(), String> {
     let mask = 1_u8
         .checked_shl(u32::from(button.saturating_sub(1)))
         .unwrap_or(0);
-    post_event(unsafe {
-        CGEventCreateMouseEvent(null_mut(), kind, current_pointer()?, cg_button)
-    })?;
+    post_event_with_flags(
+        unsafe { CGEventCreateMouseEvent(null_mut(), kind, current_pointer()?, cg_button) },
+        injected_modifier_flags(),
+    )?;
     if down {
         INJECTED_BUTTONS.fetch_or(mask, Ordering::AcqRel);
     } else {
@@ -556,26 +618,46 @@ pub fn inject_mouse_button(button: u8, down: bool) -> Result<(), String> {
 }
 
 pub fn inject_wheel(horizontal: i32, vertical: i32) -> Result<(), String> {
-    post_event(unsafe {
-        CGEventCreateScrollWheelEvent2(
-            null_mut(),
-            KCG_SCROLL_EVENT_UNIT_PIXEL,
-            2,
-            vertical,
-            horizontal,
-            0,
-        )
-    })
+    post_event_with_flags(
+        unsafe {
+            CGEventCreateScrollWheelEvent2(
+                null_mut(),
+                KCG_SCROLL_EVENT_UNIT_PIXEL,
+                2,
+                vertical,
+                horizontal,
+                0,
+            )
+        },
+        injected_modifier_flags(),
+    )
 }
 
 pub fn inject_key(usage: u16, down: bool) -> Result<(), String> {
     let Some(keycode) = hid_to_mac_keycode(usage) else {
         return Ok(());
     };
-    post_event(unsafe { CGEventCreateKeyboardEvent(null_mut(), keycode, down) })
+    let current_mods = INJECTED_MODIFIERS.load(Ordering::Acquire);
+    let next_mods = match modifier_bit(usage) {
+        Some(bit) if down => current_mods | bit,
+        Some(bit) => current_mods & !bit,
+        None => current_mods,
+    };
+    post_event_with_flags(
+        unsafe { CGEventCreateKeyboardEvent(null_mut(), keycode, down) },
+        cg_flags_from_modifiers(next_mods),
+    )?;
+    if let Some(bit) = modifier_bit(usage) {
+        if down {
+            INJECTED_MODIFIERS.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            INJECTED_MODIFIERS.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+    Ok(())
 }
 
-fn post_event(event: CGEventRef) -> Result<(), String> {
+fn post_event_with_flags(event: CGEventRef, flags: u64) -> Result<(), String> {
     if event.is_null() {
         return Err("macOS 无法创建输入事件；请检查辅助功能权限".into());
     }
@@ -584,6 +666,7 @@ fn post_event(event: CGEventRef) -> Result<(), String> {
         return Err("macOS 辅助功能权限不可用".into());
     }
     unsafe {
+        CGEventSetFlags(event, flags);
         CGEventSetIntegerValueField(event, KCG_EVENT_SOURCE_USER_DATA, INJECTION_SENTINEL);
         CGEventPost(KCG_HID_EVENT_TAP, event);
         CFRelease(event);
@@ -609,16 +692,22 @@ pub fn place_pointer(edge: Edge) -> Result<(), String> {
         x: bounds.origin.x + bounds.size.width / 2.0,
         y: bounds.origin.y + bounds.size.height / 2.0,
     });
+    let max_x = (bounds.origin.x + (bounds.size.width - 1.0).max(0.0)).max(bounds.origin.x);
+    let raw_x = match edge {
+        Edge::Left => bounds.origin.x + 8.0,
+        Edge::Right => bounds.origin.x + bounds.size.width - 9.0,
+        Edge::Disabled => bounds.origin.x + bounds.size.width / 2.0,
+    };
+    let min_y = bounds.origin.y + 24.0;
+    let max_y = bounds.origin.y + bounds.size.height - 25.0;
+    let y = if min_y <= max_y {
+        safe_clamp_f64(current.y, min_y, max_y)
+    } else {
+        bounds.origin.y + (bounds.size.height * 0.5).max(0.0)
+    };
     let point = CGPoint {
-        x: match edge {
-            Edge::Left => bounds.origin.x + 8.0,
-            Edge::Right => bounds.origin.x + bounds.size.width - 9.0,
-            Edge::Disabled => bounds.origin.x + bounds.size.width / 2.0,
-        },
-        y: current.y.clamp(
-            bounds.origin.y + 24.0,
-            bounds.origin.y + bounds.size.height - 25.0,
-        ),
+        x: safe_clamp_f64(raw_x, bounds.origin.x, max_x),
+        y,
     };
     if unsafe { CGWarpMouseCursorPosition(point) } == 0 {
         Ok(())
@@ -887,4 +976,37 @@ fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
         0xE7 => 54,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_clamp_handles_inverted_or_non_finite_bounds_without_panicking() {
+        assert_eq!(safe_clamp_f64(50.0, 100.0, 20.0), 100.0);
+        assert_eq!(safe_clamp_f64(f64::NAN, 10.0, 20.0), 10.0);
+        assert_eq!(safe_clamp_f64(15.0, 10.0, 20.0), 15.0);
+    }
+
+    #[test]
+    fn modifier_flags_sync_and_reset_cleanly() {
+        let left_shift = modifier_bit(0xE1).unwrap();
+        let right_shift = modifier_bit(0xE5).unwrap();
+        let left_cmd = modifier_bit(0xE3).unwrap();
+        assert_eq!(
+            cg_flags_from_modifiers(left_shift | left_cmd),
+            KCG_EVENT_FLAG_MASK_SHIFT | KCG_EVENT_FLAG_MASK_COMMAND
+        );
+        // Releasing left shift while right shift remains held keeps shift flag active.
+        assert_eq!(
+            cg_flags_from_modifiers((left_shift | right_shift) & !left_shift),
+            KCG_EVENT_FLAG_MASK_SHIFT
+        );
+        INJECTED_BUTTONS.store(0b11, Ordering::Release);
+        INJECTED_MODIFIERS.store(left_cmd, Ordering::Release);
+        reset_injected_state();
+        assert_eq!(INJECTED_BUTTONS.load(Ordering::Acquire), 0);
+        assert_eq!(INJECTED_MODIFIERS.load(Ordering::Acquire), 0);
+    }
 }

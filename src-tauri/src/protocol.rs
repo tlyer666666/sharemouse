@@ -1,15 +1,18 @@
 use crate::config::Edge;
 use ring::rand::SecureRandom;
-use ring::{aead, hkdf, hmac, rand};
+use ring::{aead, agreement, hkdf, hmac, rand};
 use std::convert::TryInto;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 const MAGIC: &[u8; 8] = b"DSKBRG01";
-const PROTOCOL_VERSION: u16 = 1;
-const HELLO_SIZE: usize = 8 + 2 + 32 + 32 + 32;
+const PROTOCOL_VERSION: u16 = 2;
+const HELLO_BODY_SIZE: usize = 8 + 2 + 32 + 32 + 32;
+const HELLO_SIZE: usize = HELLO_BODY_SIZE + 32;
+const CLIENT_FINISH_SIZE: usize = 32;
 const MAX_FRAME_SIZE: usize = 64;
+const PREAUTH_READ_DEADLINE: Duration = Duration::from_secs(1);
 const IO_DEADLINE: Duration = Duration::from_secs(3);
 const WRITE_DEADLINE: Duration = Duration::from_millis(750);
 
@@ -88,10 +91,12 @@ impl WireMessage {
                 dx: i32::from_be_bytes(input[1..5].try_into().unwrap()),
                 dy: i32::from_be_bytes(input[5..9].try_into().unwrap()),
             }),
-            4 if input.len() == 3 && input[2] <= 1 => Ok(Self::MouseButton {
-                button: input[1],
-                down: input[2] == 1,
-            }),
+            4 if input.len() == 3 && (1..=5).contains(&input[1]) && input[2] <= 1 => {
+                Ok(Self::MouseButton {
+                    button: input[1],
+                    down: input[2] == 1,
+                })
+            }
             5 if input.len() == 9 => Ok(Self::Wheel {
                 horizontal: i32::from_be_bytes(input[1..5].try_into().unwrap()),
                 vertical: i32::from_be_bytes(input[5..9].try_into().unwrap()),
@@ -208,30 +213,71 @@ pub fn client_handshake(
     pairing_key: &[u8; 32],
 ) -> io::Result<Session> {
     configure_stream(&stream)?;
+    let rng = rand::SystemRandom::new();
     let client_nonce = random_nonce()?;
     let client_id = node_id_bytes(node_id)?;
-    let client_unsigned = hello_unsigned(&client_id, &client_nonce);
-    let auth_key = hmac::Key::new(hmac::HMAC_SHA256, pairing_key);
-    let mut hello = client_unsigned.clone();
-    hello.extend_from_slice(hmac::sign(&auth_key, &client_unsigned).as_ref());
-    write_all_until(&mut stream, &hello, Instant::now() + WRITE_DEADLINE)?;
+    let client_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+        .map_err(|_| io::Error::other("ephemeral key generation failed"))?;
+    let client_pub: [u8; 32] = client_private
+        .compute_public_key()
+        .map_err(|_| io::Error::other("ephemeral public key failed"))?
+        .as_ref()
+        .try_into()
+        .map_err(|_| invalid_data("unexpected X25519 public key length"))?;
 
-    let mut response = [0_u8; HELLO_SIZE];
-    read_exact_until(&mut stream, &mut response, Instant::now() + IO_DEADLINE)?;
-    let (peer_id, server_nonce) = verify_server_hello(&response, &client_nonce, &auth_key)?;
-    let (client_to_server, server_to_client) =
-        derive_keys(pairing_key, &client_nonce, &server_nonce)?;
+    let client_body = hello_body(&client_id, &client_nonce, &client_pub);
+    let auth_key = hmac::Key::new(hmac::HMAC_SHA256, pairing_key);
+    let mut client_hello = Vec::with_capacity(HELLO_SIZE);
+    client_hello.extend_from_slice(&client_body);
+    client_hello.extend_from_slice(
+        hmac::sign(&auth_key, &client_hello_mac_input(&client_body)).as_ref(),
+    );
+    write_all_until(&mut stream, &client_hello, Instant::now() + WRITE_DEADLINE)?;
+
+    let mut server_hello = [0_u8; HELLO_SIZE];
+    read_exact_until(&mut stream, &mut server_hello, Instant::now() + IO_DEADLINE)?;
+    let (peer_id, server_id, server_nonce, server_pub) =
+        verify_server_hello(&server_hello, &client_body, &auth_key)?;
+    let server_body: [u8; HELLO_BODY_SIZE] = server_hello[..HELLO_BODY_SIZE].try_into().unwrap();
+
+    let (mut finish_key, mut client_to_server, mut server_to_client) = agree_and_derive_keys(
+        client_private,
+        &server_pub,
+        pairing_key,
+        &client_id,
+        &server_id,
+        &client_nonce,
+        &server_nonce,
+        &client_pub,
+        &server_pub,
+    )?;
+
+    let finish_mac_key = hmac::Key::new(hmac::HMAC_SHA256, &finish_key);
+    let finish_input = client_finish_mac_input(&client_body, &server_body);
+    let finish_tag = hmac::sign(&finish_mac_key, &finish_input);
+    finish_key.fill(0);
+    write_all_until(
+        &mut stream,
+        finish_tag.as_ref(),
+        Instant::now() + WRITE_DEADLINE,
+    )?;
+
+    let reader_key = aead_key(&server_to_client)?;
+    let writer_key = aead_key(&client_to_server)?;
+    client_to_server.fill(0);
+    server_to_client.fill(0);
+
     let reader_stream = stream.try_clone()?;
     Ok(Session {
         peer_id,
         reader: SecureReader {
             stream: reader_stream,
-            key: aead_key(&server_to_client)?,
+            key: reader_key,
             sequence: 0,
         },
         writer: SecureWriter {
             stream,
-            key: aead_key(&client_to_server)?,
+            key: writer_key,
             sequence: 0,
         },
     })
@@ -243,31 +289,84 @@ pub fn server_handshake(
     pairing_key: &[u8; 32],
 ) -> io::Result<Session> {
     configure_stream(&stream)?;
+    let handshake_deadline = Instant::now() + PREAUTH_READ_DEADLINE;
     let auth_key = hmac::Key::new(hmac::HMAC_SHA256, pairing_key);
-    let mut hello = [0_u8; HELLO_SIZE];
-    read_exact_until(&mut stream, &mut hello, Instant::now() + IO_DEADLINE)?;
-    let (peer_id, client_nonce) = verify_client_hello(&hello, &auth_key)?;
 
+    let mut client_hello = [0_u8; HELLO_SIZE];
+    read_exact_until(&mut stream, &mut client_hello, handshake_deadline)?;
+    let (peer_id, client_id, client_nonce, client_pub) =
+        verify_client_hello(&client_hello, &auth_key)?;
+    let client_body: [u8; HELLO_BODY_SIZE] = client_hello[..HELLO_BODY_SIZE].try_into().unwrap();
+
+    let rng = rand::SystemRandom::new();
     let server_nonce = random_nonce()?;
     let server_id = node_id_bytes(node_id)?;
-    let unsigned = server_hello_unsigned(&server_id, &server_nonce, &client_nonce);
-    let mut response = hello_unsigned(&server_id, &server_nonce);
-    response.extend_from_slice(hmac::sign(&auth_key, &unsigned).as_ref());
-    write_all_until(&mut stream, &response, Instant::now() + WRITE_DEADLINE)?;
+    let server_private = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
+        .map_err(|_| io::Error::other("ephemeral key generation failed"))?;
+    let server_pub: [u8; 32] = server_private
+        .compute_public_key()
+        .map_err(|_| io::Error::other("ephemeral public key failed"))?
+        .as_ref()
+        .try_into()
+        .map_err(|_| invalid_data("unexpected X25519 public key length"))?;
 
-    let (client_to_server, server_to_client) =
-        derive_keys(pairing_key, &client_nonce, &server_nonce)?;
+    let server_body = hello_body(&server_id, &server_nonce, &server_pub);
+    let (mut finish_key, mut client_to_server, mut server_to_client) = agree_and_derive_keys(
+        server_private,
+        &client_pub,
+        pairing_key,
+        &client_id,
+        &server_id,
+        &client_nonce,
+        &server_nonce,
+        &client_pub,
+        &server_pub,
+    )?;
+
+    let mut response = Vec::with_capacity(HELLO_SIZE);
+    response.extend_from_slice(&server_body);
+    response.extend_from_slice(
+        hmac::sign(&auth_key, &server_hello_mac_input(&client_body, &server_body)).as_ref(),
+    );
+    write_all_until(
+        &mut stream,
+        &response,
+        handshake_deadline.min(Instant::now() + WRITE_DEADLINE),
+    )?;
+
+    // 3rd pass: require ClientFinish authenticating server_nonce & ephemeral transcript
+    // before accepting the session (defeats ClientHello replay).
+    let mut client_finish = [0_u8; CLIENT_FINISH_SIZE];
+    read_exact_until(&mut stream, &mut client_finish, handshake_deadline)?;
+    let finish_mac_key = hmac::Key::new(hmac::HMAC_SHA256, &finish_key);
+    let finish_input = client_finish_mac_input(&client_body, &server_body);
+    let verified = hmac::verify(&finish_mac_key, &finish_input, &client_finish);
+    finish_key.fill(0);
+    if verified.is_err() {
+        client_to_server.fill(0);
+        server_to_client.fill(0);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "client finish authentication failed",
+        ));
+    }
+
+    let reader_key = aead_key(&client_to_server)?;
+    let writer_key = aead_key(&server_to_client)?;
+    client_to_server.fill(0);
+    server_to_client.fill(0);
+
     let reader_stream = stream.try_clone()?;
     Ok(Session {
         peer_id,
         reader: SecureReader {
             stream: reader_stream,
-            key: aead_key(&client_to_server)?,
+            key: reader_key,
             sequence: 0,
         },
         writer: SecureWriter {
             stream,
-            key: aead_key(&server_to_client)?,
+            key: writer_key,
             sequence: 0,
         },
     })
@@ -276,32 +375,26 @@ pub fn server_handshake(
 fn verify_client_hello(
     hello: &[u8; HELLO_SIZE],
     auth_key: &hmac::Key,
-) -> io::Result<(String, [u8; 32])> {
+) -> io::Result<(String, [u8; 32], [u8; 32], [u8; 32])> {
     verify_common_header(hello)?;
-    hmac::verify(
-        auth_key,
-        &hello[..HELLO_SIZE - 32],
-        &hello[HELLO_SIZE - 32..],
-    )
-    .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "pairing key rejected"))?;
-    Ok(read_hello_identity_and_nonce(hello))
+    let body: &[u8; HELLO_BODY_SIZE] = hello[..HELLO_BODY_SIZE].try_into().unwrap();
+    let mac_input = client_hello_mac_input(body);
+    hmac::verify(auth_key, &mac_input, &hello[HELLO_BODY_SIZE..])
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "pairing key rejected"))?;
+    Ok(read_hello_fields(body))
 }
 
 fn verify_server_hello(
     hello: &[u8; HELLO_SIZE],
-    client_nonce: &[u8; 32],
+    client_body: &[u8; HELLO_BODY_SIZE],
     auth_key: &hmac::Key,
-) -> io::Result<(String, [u8; 32])> {
+) -> io::Result<(String, [u8; 32], [u8; 32], [u8; 32])> {
     verify_common_header(hello)?;
-    let mut signed = server_hello_unsigned(
-        hello[10..42].try_into().unwrap(),
-        hello[42..74].try_into().unwrap(),
-        client_nonce,
-    );
-    hmac::verify(auth_key, &signed, &hello[HELLO_SIZE - 32..])
+    let server_body: &[u8; HELLO_BODY_SIZE] = hello[..HELLO_BODY_SIZE].try_into().unwrap();
+    let mac_input = server_hello_mac_input(client_body, server_body);
+    hmac::verify(auth_key, &mac_input, &hello[HELLO_BODY_SIZE..])
         .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "pairing key rejected"))?;
-    signed.fill(0);
-    Ok(read_hello_identity_and_nonce(hello))
+    Ok(read_hello_fields(server_body))
 }
 
 fn verify_common_header(hello: &[u8; HELLO_SIZE]) -> io::Result<()> {
@@ -313,46 +406,123 @@ fn verify_common_header(hello: &[u8; HELLO_SIZE]) -> io::Result<()> {
     Ok(())
 }
 
-fn read_hello_identity_and_nonce(hello: &[u8; HELLO_SIZE]) -> (String, [u8; 32]) {
-    let peer_id = String::from_utf8_lossy(&hello[10..42]).to_string();
-    let nonce = hello[42..74].try_into().unwrap();
-    (peer_id, nonce)
+fn read_hello_fields(body: &[u8; HELLO_BODY_SIZE]) -> (String, [u8; 32], [u8; 32], [u8; 32]) {
+    let id_bytes: [u8; 32] = body[10..42].try_into().unwrap();
+    let peer_id = String::from_utf8_lossy(&id_bytes).to_string();
+    let nonce: [u8; 32] = body[42..74].try_into().unwrap();
+    let ephemeral_pub: [u8; 32] = body[74..106].try_into().unwrap();
+    (peer_id, id_bytes, nonce, ephemeral_pub)
 }
 
-fn hello_unsigned(node_id: &[u8; 32], nonce: &[u8; 32]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(HELLO_SIZE - 32);
-    output.extend_from_slice(MAGIC);
-    output.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    output.extend_from_slice(node_id);
-    output.extend_from_slice(nonce);
-    output
-}
-
-fn server_hello_unsigned(
+fn hello_body(
     node_id: &[u8; 32],
-    server_nonce: &[u8; 32],
-    client_nonce: &[u8; 32],
-) -> Vec<u8> {
-    let mut output = b"server-response".to_vec();
-    output.extend_from_slice(client_nonce);
-    output.extend_from_slice(&hello_unsigned(node_id, server_nonce));
+    nonce: &[u8; 32],
+    ephemeral_pub: &[u8; 32],
+) -> [u8; HELLO_BODY_SIZE] {
+    let mut output = [0_u8; HELLO_BODY_SIZE];
+    output[..8].copy_from_slice(MAGIC);
+    output[8..10].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    output[10..42].copy_from_slice(node_id);
+    output[42..74].copy_from_slice(nonce);
+    output[74..106].copy_from_slice(ephemeral_pub);
     output
 }
 
-fn derive_keys(
+fn client_hello_mac_input(client_body: &[u8; HELLO_BODY_SIZE]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(15 + HELLO_BODY_SIZE);
+    output.extend_from_slice(b"client-hello-v2");
+    output.extend_from_slice(client_body);
+    output
+}
+
+fn server_hello_mac_input(
+    client_body: &[u8; HELLO_BODY_SIZE],
+    server_body: &[u8; HELLO_BODY_SIZE],
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(15 + HELLO_BODY_SIZE * 2);
+    output.extend_from_slice(b"server-hello-v2");
+    output.extend_from_slice(client_body);
+    output.extend_from_slice(server_body);
+    output
+}
+
+fn client_finish_mac_input(
+    client_body: &[u8; HELLO_BODY_SIZE],
+    server_body: &[u8; HELLO_BODY_SIZE],
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(16 + HELLO_BODY_SIZE * 2);
+    output.extend_from_slice(b"client-finish-v2");
+    output.extend_from_slice(client_body);
+    output.extend_from_slice(server_body);
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agree_and_derive_keys(
+    private_key: agreement::EphemeralPrivateKey,
+    peer_public_bytes: &[u8; 32],
     pairing_key: &[u8; 32],
+    client_id: &[u8; 32],
+    server_id: &[u8; 32],
     client_nonce: &[u8; 32],
     server_nonce: &[u8; 32],
-) -> io::Result<([u8; 32], [u8; 32])> {
-    let mut salt_bytes = [0_u8; 64];
-    salt_bytes[..32].copy_from_slice(client_nonce);
-    salt_bytes[32..].copy_from_slice(server_nonce);
+    client_pub: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> io::Result<([u8; 32], [u8; 32], [u8; 32])> {
+    let peer_public = agreement::UnparsedPublicKey::new(&agreement::X25519, peer_public_bytes);
+    agreement::agree_ephemeral(private_key, &peer_public, |shared_secret| {
+        derive_keys(
+            shared_secret,
+            pairing_key,
+            client_id,
+            server_id,
+            client_nonce,
+            server_nonce,
+            client_pub,
+            server_pub,
+        )
+    })
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "X25519 key agreement failed"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_keys(
+    shared_secret: &[u8],
+    pairing_key: &[u8; 32],
+    client_id: &[u8; 32],
+    server_id: &[u8; 32],
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+    client_pub: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> io::Result<([u8; 32], [u8; 32], [u8; 32])> {
+    let mut salt_bytes = [0_u8; 192];
+    salt_bytes[0..32].copy_from_slice(client_id);
+    salt_bytes[32..64].copy_from_slice(server_id);
+    salt_bytes[64..96].copy_from_slice(client_nonce);
+    salt_bytes[96..128].copy_from_slice(server_nonce);
+    salt_bytes[128..160].copy_from_slice(client_pub);
+    salt_bytes[160..192].copy_from_slice(server_pub);
+
+    let mut ikm = Vec::with_capacity(shared_secret.len() + 32);
+    ikm.extend_from_slice(shared_secret);
+    ikm.extend_from_slice(pairing_key);
+
     let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &salt_bytes);
-    let pseudo_random_key = salt.extract(pairing_key);
-    let client_info = [b"DeskBridge v1 client to server".as_slice()];
-    let server_info = [b"DeskBridge v1 server to client".as_slice()];
+    let pseudo_random_key = salt.extract(&ikm);
+    ikm.fill(0);
+
+    let finish_info = [b"DeskBridge v2 client finish".as_slice()];
+    let client_info = [b"DeskBridge v2 client to server".as_slice()];
+    let server_info = [b"DeskBridge v2 server to client".as_slice()];
+    let mut finish_key = [0_u8; 32];
     let mut client_key = [0_u8; 32];
     let mut server_key = [0_u8; 32];
+    pseudo_random_key
+        .expand(&finish_info, KeyLength32)
+        .map_err(|_| invalid_data("key derivation failed"))?
+        .fill(&mut finish_key)
+        .map_err(|_| invalid_data("key derivation failed"))?;
     pseudo_random_key
         .expand(&client_info, KeyLength32)
         .map_err(|_| invalid_data("key derivation failed"))?
@@ -363,7 +533,7 @@ fn derive_keys(
         .map_err(|_| invalid_data("key derivation failed"))?
         .fill(&mut server_key)
         .map_err(|_| invalid_data("key derivation failed"))?;
-    Ok((client_key, server_key))
+    Ok((finish_key, client_key, server_key))
 }
 
 #[derive(Clone, Copy)]
@@ -508,5 +678,79 @@ mod tests {
             .unwrap();
         assert_eq!(session.reader.receive().unwrap(), WireMessage::ActivateAck);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn mouse_button_decode_enforces_range_1_to_5() {
+        for button in 1..=5 {
+            let encoded = WireMessage::MouseButton { button, down: true }.encode();
+            assert_eq!(
+                WireMessage::decode(&encoded).unwrap(),
+                WireMessage::MouseButton { button, down: true }
+            );
+        }
+        assert!(WireMessage::decode(&[4, 0, 1]).is_err());
+        assert!(WireMessage::decode(&[4, 6, 1]).is_err());
+        assert!(WireMessage::decode(&[4, 255, 0]).is_err());
+    }
+
+    #[test]
+    fn replayed_client_hello_is_rejected_at_client_finish() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = [9_u8; 32];
+
+        // Construct a valid ClientHello packet as if captured on the wire.
+        let rng = rand::SystemRandom::new();
+        let client_private =
+            agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
+        let client_pub: [u8; 32] = client_private
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let client_nonce = random_nonce().unwrap();
+        let client_id = node_id_bytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let client_body = hello_body(&client_id, &client_nonce, &client_pub);
+        let auth_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+        let mut captured_hello = Vec::with_capacity(HELLO_SIZE);
+        captured_hello.extend_from_slice(&client_body);
+        captured_hello.extend_from_slice(
+            hmac::sign(&auth_key, &client_hello_mac_input(&client_body)).as_ref(),
+        );
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server_handshake(stream, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &key)
+        });
+
+        let mut attacker = TcpStream::connect(address).unwrap();
+        attacker.write_all(&captured_hello).unwrap();
+        let mut server_hello = [0_u8; HELLO_SIZE];
+        attacker.read_exact(&mut server_hello).unwrap();
+        // Attacker cannot forge ClientFinish for fresh server_nonce.
+        attacker.write_all(&[0x42_u8; CLIENT_FINISH_SIZE]).unwrap();
+
+        let result = server.join().unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stalled_preauth_connection_times_out_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = [5_u8; 32];
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let started = Instant::now();
+            let result = server_handshake(stream, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &key);
+            (result.is_err(), started.elapsed())
+        });
+
+        let _stalled_client = TcpStream::connect(address).unwrap();
+        let (failed, elapsed) = server.join().unwrap();
+        assert!(failed);
+        assert!(elapsed <= Duration::from_millis(1600));
     }
 }

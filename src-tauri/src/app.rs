@@ -131,10 +131,7 @@ fn request_permissions(context: State<'_, AppContext>) -> Result<Snapshot, Strin
 
 pub fn run() {
     let (settings, config_path) = config::load_or_create().unwrap_or_else(|error| {
-        eprintln!("DeskBridge configuration warning: {error}");
-        let settings = Settings::default();
-        let fallback = std::env::temp_dir().join("deskbridge-settings.json");
-        (settings, fallback)
+        panic!("DeskBridge 配置初始化失败，拒绝回退到不安全的临时目录：{error}");
     });
     let service = Service::start(settings).unwrap_or_else(|error| {
         panic!("DeskBridge 无法启动：{error}");

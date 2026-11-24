@@ -18,6 +18,8 @@ const MOUSE_MOVE_INTERVAL: Duration = Duration::from_millis(8);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(4);
 const INPUT_QUEUE_CAPACITY: usize = 512;
 const MAX_PREAUTH_CONNECTIONS: usize = 4;
+const PREAUTH_SATURATED_BACKOFF: Duration = Duration::from_millis(25);
+const REJECTED_ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,7 +52,7 @@ pub struct Service {
     pub capture_control: Arc<CaptureControl>,
     shutdown: Arc<AtomicBool>,
     incoming_generation: Arc<AtomicU64>,
-    incoming_sessions: Arc<Mutex<Vec<IncomingAttempt>>>,
+    incoming_sessions: Arc<Mutex<IncomingRegistry>>,
     outgoing_generation: Arc<AtomicU64>,
     outgoing_stream: Arc<Mutex<Option<TcpStream>>>,
     event_sender: SyncSender<CaptureEvent>,
@@ -80,7 +82,7 @@ impl Service {
         let capture_control = Arc::new(CaptureControl::new(enabled, edge, edge_delay));
         let shutdown = Arc::new(AtomicBool::new(false));
         let incoming_generation = Arc::new(AtomicU64::new(1));
-        let incoming_sessions = Arc::new(Mutex::new(Vec::new()));
+        let incoming_sessions = Arc::new(Mutex::new(IncomingRegistry::default()));
         let outgoing_generation = Arc::new(AtomicU64::new(1));
         let outgoing_stream = Arc::new(Mutex::new(None));
         let session_owner = Arc::new(AtomicU8::new(SESSION_IDLE));
@@ -904,53 +906,98 @@ fn is_lan_ip(address: IpAddr) -> bool {
 }
 
 struct IncomingAttempt {
+    id: u64,
     source: IpAddr,
     stream: TcpStream,
     thread: JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct IncomingRegistry {
+    preauth: Vec<IncomingAttempt>,
+    active: Option<IncomingAttempt>,
+}
+
+impl IncomingRegistry {
+    fn is_preauth_saturated(&self) -> bool {
+        self.preauth.len() >= MAX_PREAUTH_CONNECTIONS
+    }
+
+    fn can_accept_preauth(&self, source: IpAddr) -> bool {
+        !self.is_preauth_saturated() && !self.preauth.iter().any(|attempt| attempt.source == source)
+    }
+
+    fn promote_to_active(&mut self, attempt_id: u64) -> Option<JoinHandle<()>> {
+        let index = self
+            .preauth
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)?;
+        let promoted = self.preauth.swap_remove(index);
+        self.active.replace(promoted).map(|previous| previous.thread)
+    }
+}
+
 fn spawn_listener(
     listener: TcpListener,
     incoming: IncomingContext,
-    incoming_sessions: Arc<Mutex<Vec<IncomingAttempt>>>,
+    incoming_sessions: Arc<Mutex<IncomingRegistry>>,
 ) -> Result<JoinHandle<()>, String> {
     thread::Builder::new()
         .name("deskbridge-listener".into())
         .spawn(move || {
             while !incoming.shutdown.load(Ordering::Acquire) {
                 reap_finished_threads(&incoming_sessions);
+                let saturated = incoming_sessions
+                    .lock()
+                    .map(|registry| registry.is_preauth_saturated())
+                    .unwrap_or(false);
+                if saturated {
+                    thread::sleep(PREAUTH_SATURATED_BACKOFF);
+                    continue;
+                }
                 match listener.accept() {
                     Ok((stream, address)) => {
                         if !is_lan_ip(address.ip()) {
                             drop(stream);
+                            thread::sleep(REJECTED_ACCEPT_BACKOFF);
                             continue;
                         }
-                        let Ok(mut session_slots) = incoming_sessions.lock() else {
+                        let Ok(mut registry) = incoming_sessions.lock() else {
                             drop(stream);
+                            thread::sleep(REJECTED_ACCEPT_BACKOFF);
                             continue;
                         };
                         if incoming.shutdown.load(Ordering::Acquire)
-                            || session_slots.len() >= MAX_PREAUTH_CONNECTIONS
-                            || session_slots
-                                .iter()
-                                .any(|attempt| attempt.source == address.ip())
+                            || !registry.can_accept_preauth(address.ip())
                         {
+                            drop(registry);
                             drop(stream);
+                            thread::sleep(REJECTED_ACCEPT_BACKOFF);
                             continue;
                         }
                         let accepted_generation = incoming.generation.load(Ordering::Acquire);
+                        let attempt_id = next_incoming_attempt_id();
                         let session_context = incoming.clone();
+                        let registry_handle = Arc::clone(&incoming_sessions);
                         let Ok(cancellation_stream) = stream.try_clone() else {
+                            drop(registry);
                             drop(stream);
                             continue;
                         };
                         if let Ok(session) = thread::Builder::new()
                             .name("deskbridge-receiver-session".into())
                             .spawn(move || {
-                                handle_incoming(stream, session_context, accepted_generation)
+                                handle_incoming(
+                                    stream,
+                                    session_context,
+                                    accepted_generation,
+                                    attempt_id,
+                                    registry_handle,
+                                )
                             })
                         {
-                            session_slots.push(IncomingAttempt {
+                            registry.preauth.push(IncomingAttempt {
+                                id: attempt_id,
                                 source: address.ip(),
                                 stream: cancellation_stream,
                                 thread: session,
@@ -987,7 +1034,13 @@ struct IncomingContext {
     session_owner: Arc<AtomicU8>,
 }
 
-fn handle_incoming(stream: TcpStream, context: IncomingContext, accepted_generation: u64) {
+fn handle_incoming(
+    stream: TcpStream,
+    context: IncomingContext,
+    accepted_generation: u64,
+    attempt_id: u64,
+    incoming_sessions: Arc<Mutex<IncomingRegistry>>,
+) {
     let IncomingContext {
         settings,
         status,
@@ -1024,6 +1077,7 @@ fn handle_incoming(stream: TcpStream, context: IncomingContext, accepted_generat
     {
         return;
     }
+    // Acquire SESSION_INCOMING only after 3-pass X25519 + ClientFinish handshake succeeds.
     if session_owner
         .compare_exchange(
             SESSION_IDLE,
@@ -1039,8 +1093,9 @@ fn handle_incoming(stream: TcpStream, context: IncomingContext, accepted_generat
         owner: session_owner,
         expected: SESSION_INCOMING,
     };
+    promote_incoming_session(&incoming_sessions, attempt_id);
 
-    let mut injector = Injector::new();
+    let mut injector = Injector::new(Arc::clone(&shutdown));
     let mut activated = false;
     let mut last_permission_check = Instant::now();
     while !shutdown.load(Ordering::Acquire) {
@@ -1145,10 +1200,23 @@ fn close_stream(stream: &Mutex<Option<TcpStream>>) {
     }
 }
 
-fn close_incoming_streams(attempts: &Mutex<Vec<IncomingAttempt>>) {
-    if let Ok(attempts) = attempts.lock() {
-        for attempt in attempts.iter() {
+fn promote_incoming_session(registry: &Mutex<IncomingRegistry>, attempt_id: u64) {
+    let previous = registry
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.promote_to_active(attempt_id));
+    if let Some(thread) = previous {
+        let _ = thread.join();
+    }
+}
+
+fn close_incoming_streams(registry: &Mutex<IncomingRegistry>) {
+    if let Ok(registry) = registry.lock() {
+        for attempt in registry.preauth.iter() {
             let _ = attempt.stream.shutdown(Shutdown::Both);
+        }
+        if let Some(active) = registry.active.as_ref() {
+            let _ = active.stream.shutdown(Shutdown::Both);
         }
     }
 }
@@ -1176,26 +1244,39 @@ fn cancel_outgoing(
     }
 }
 
-fn take_incoming_threads(slot: &Mutex<Vec<IncomingAttempt>>) -> Vec<JoinHandle<()>> {
+fn take_incoming_threads(slot: &Mutex<IncomingRegistry>) -> Vec<JoinHandle<()>> {
     slot.lock()
-        .map(|mut attempts| {
-            std::mem::take(&mut *attempts)
+        .map(|mut registry| {
+            let mut threads: Vec<_> = std::mem::take(&mut registry.preauth)
                 .into_iter()
                 .map(|attempt| attempt.thread)
-                .collect()
+                .collect();
+            if let Some(active) = registry.active.take() {
+                threads.push(active.thread);
+            }
+            threads
         })
         .unwrap_or_default()
 }
 
-fn reap_finished_threads(slot: &Mutex<Vec<IncomingAttempt>>) {
+fn reap_finished_threads(slot: &Mutex<IncomingRegistry>) {
     let mut finished = Vec::new();
-    if let Ok(mut attempts) = slot.lock() {
+    if let Ok(mut registry) = slot.lock() {
         let mut index = 0;
-        while index < attempts.len() {
-            if attempts[index].thread.is_finished() {
-                finished.push(attempts.swap_remove(index).thread);
+        while index < registry.preauth.len() {
+            if registry.preauth[index].thread.is_finished() {
+                finished.push(registry.preauth.swap_remove(index).thread);
             } else {
                 index += 1;
+            }
+        }
+        if registry
+            .active
+            .as_ref()
+            .is_some_and(|active| active.thread.is_finished())
+        {
+            if let Some(active) = registry.active.take() {
+                finished.push(active.thread);
             }
         }
     }
@@ -1235,6 +1316,11 @@ fn monotonic_ms() -> u64 {
 fn next_outgoing_session_id() -> u64 {
     static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn next_incoming_attempt_id() -> u64 {
+    static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1315,5 +1401,33 @@ mod tests {
         assert!(!is_session_state("ready"));
         assert!(!is_session_state("paused"));
         assert!(!is_session_state("error"));
+    }
+
+    #[test]
+    fn promoting_incoming_attempt_frees_preauth_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+
+        let mut registry = IncomingRegistry::default();
+        let source: IpAddr = "10.0.0.10".parse().unwrap();
+        registry.preauth.push(IncomingAttempt {
+            id: 42,
+            source,
+            stream,
+            thread: thread::spawn(|| {}),
+        });
+        assert!(!registry.can_accept_preauth(source));
+        assert_eq!(registry.preauth.len(), 1);
+        assert!(registry.active.is_none());
+
+        assert!(registry.promote_to_active(42).is_none());
+        assert_eq!(registry.preauth.len(), 0);
+        assert!(registry.active.is_some());
+        assert!(registry.can_accept_preauth(source));
+        if let Some(active) = registry.active.take() {
+            let _ = active.thread.join();
+        }
     }
 }

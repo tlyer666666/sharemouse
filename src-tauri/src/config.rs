@@ -121,13 +121,14 @@ pub fn load_or_create() -> Result<(Settings, PathBuf), String> {
 }
 
 pub fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("创建配置目录失败：{error}"))?;
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "配置路径缺少父目录".to_string())?;
+    ensure_config_dir(parent).map_err(|error| format!("创建配置目录失败：{error}"))?;
     let payload =
         serde_json::to_vec_pretty(settings).map_err(|error| format!("序列化配置失败：{error}"))?;
-    fs::write(path, payload).map_err(|error| format!("保存配置失败：{error}"))?;
-    tighten_permissions(path).map_err(|error| format!("保护配置文件失败：{error}"))?;
+    write_config_atomically(path, parent, &payload)
+        .map_err(|error| format!("保存配置失败：{error}"))?;
     Ok(())
 }
 
@@ -184,11 +185,21 @@ fn random_hex(byte_count: usize) -> String {
 }
 
 fn default_device_name() -> String {
-    std::env::var("COMPUTERNAME")
+    let raw = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "我的电脑".to_string())
+        .unwrap_or_default();
+    truncate_device_name(&raw)
+}
+
+fn truncate_device_name(raw: &str) -> String {
+    let truncated: String = raw.trim().chars().take(48).collect();
+    let trimmed = truncated.trim();
+    if trimmed.is_empty() {
+        "我的电脑".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn validate_manual_address(value: &str) -> Result<(), String> {
@@ -207,14 +218,51 @@ fn validate_manual_address(value: &str) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn tighten_permissions(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+fn ensure_config_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn tighten_permissions(_path: &Path) -> io::Result<()> {
+fn ensure_config_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
+#[cfg(unix)]
+fn write_config_atomically(path: &Path, parent: &Path, payload: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", random_hex(8)));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    if let Err(error) = file.write_all(payload).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_config_atomically(path: &Path, _parent: &Path, payload: &[u8]) -> io::Result<()> {
+    fs::write(path, payload)
 }
 
 #[cfg(test)]
@@ -233,5 +281,31 @@ mod tests {
     #[test]
     fn invalid_pairing_key_is_rejected() {
         assert!(normalize_pairing_key("123456").is_err());
+    }
+
+    #[test]
+    fn long_device_name_is_truncated_to_48_chars() {
+        let long_name = "a".repeat(80);
+        let truncated = truncate_device_name(&long_name);
+        assert_eq!(truncated.chars().count(), 48);
+        assert_eq!(truncate_device_name("   "), "我的电脑");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_writes_atomically_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("deskbridge-cfg-test-{}", random_hex(8)));
+        let path = dir.join("settings.json");
+        let settings = Settings::default();
+        save_to(&path, &settings).unwrap();
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

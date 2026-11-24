@@ -85,18 +85,21 @@ pub struct Injector {
     pressed_buttons: HashSet<u8>,
     return_edge: Edge,
     activated_at: Instant,
+    shutdown: Arc<AtomicBool>,
 }
 
-type ReleaseRequest = (HashSet<u16>, HashSet<u8>);
+type ReleaseRequest = (HashSet<u16>, HashSet<u8>, Arc<AtomicBool>);
 static RELEASE_WORKER: OnceLock<SyncSender<ReleaseRequest>> = OnceLock::new();
+const MAX_RELEASE_RETRIES: usize = 8;
 
 impl Injector {
-    pub fn new() -> Self {
+    pub fn new(shutdown: Arc<AtomicBool>) -> Self {
         Self {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             return_edge: Edge::Disabled,
             activated_at: Instant::now(),
+            shutdown,
         }
     }
 
@@ -158,6 +161,7 @@ impl Injector {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        implementation::reset_injected_state();
         self.return_edge = Edge::Disabled;
     }
 }
@@ -168,16 +172,18 @@ impl Drop for Injector {
         if self.pressed_keys.is_empty() && self.pressed_buttons.is_empty() {
             return;
         }
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let request = (
             std::mem::take(&mut self.pressed_keys),
             std::mem::take(&mut self.pressed_buttons),
+            Arc::clone(&self.shutdown),
         );
+        // Never block Drop: SessionOwnerGuard drops right after Injector, so blocking
+        // here would deadlock SESSION_INCOMING if the release worker is busy.
         if let Some(worker) = RELEASE_WORKER.get() {
-            if let Err(error) = worker.send(request) {
-                retry_releases(error.0);
-            }
-        } else {
-            retry_releases(request);
+            let _ = worker.try_send(request);
         }
     }
 }
@@ -207,17 +213,28 @@ fn ensure_release_worker() -> Result<(), String> {
     Ok(())
 }
 
-fn retry_releases((mut keys, mut buttons): ReleaseRequest) {
+fn retry_releases((mut keys, mut buttons, shutdown): ReleaseRequest) {
     let mut delay = Duration::from_millis(100);
-    while !keys.is_empty() || !buttons.is_empty() {
+    for _ in 0..MAX_RELEASE_RETRIES {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         keys.retain(|usage| implementation::inject_key(*usage, false).is_err());
         buttons.retain(|button| implementation::inject_mouse_button(*button, false).is_err());
         if keys.is_empty() && buttons.is_empty() {
             break;
         }
-        thread::sleep(delay);
-        delay = (delay * 2).min(Duration::from_secs(30));
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
+    implementation::reset_injected_state();
 }
 
 fn try_send_capture(

@@ -456,8 +456,8 @@ fn on_activation_edge(context: &HookContext, point: Point) -> bool {
 fn mouse_message(message: usize, data: &MouseHookData, anchor: Point) -> Option<WireMessage> {
     match message {
         WM_MOUSEMOVE => {
-            let dx = data.point.x - anchor.x;
-            let dy = data.point.y - anchor.y;
+            let dx = data.point.x.saturating_sub(anchor.x);
+            let dy = data.point.y.saturating_sub(anchor.y);
             (dx != 0 || dy != 0).then_some(WireMessage::MouseMove { dx, dy })
         }
         WM_LBUTTONDOWN => Some(WireMessage::MouseButton {
@@ -516,14 +516,24 @@ fn wheel_delta(mouse_data: u32) -> i32 {
     ((mouse_data >> 16) as u16 as i16) as i32
 }
 
+fn safe_clamp_i32(value: i32, min: i32, max: i32) -> i32 {
+    if min > max {
+        min
+    } else {
+        value.clamp(min, max)
+    }
+}
+
 pub fn inject_mouse_move(dx: i32, dy: i32) -> Result<(), String> {
     let mut point = Point::default();
     if unsafe { GetCursorPos(&mut point) } == 0 {
         return Err("无法读取鼠标位置".into());
     }
     let (left, top, width, height) = virtual_screen();
-    let target_x = (point.x + dx).clamp(left, left + width - 1);
-    let target_y = (point.y + dy).clamp(top, top + height - 1);
+    let max_x = left.saturating_add(width.saturating_sub(1)).max(left);
+    let max_y = top.saturating_add(height.saturating_sub(1)).max(top);
+    let target_x = safe_clamp_i32(point.x.saturating_add(dx), left, max_x);
+    let target_y = safe_clamp_i32(point.y.saturating_add(dy), top, max_y);
     let normalized_x = ((target_x - left) as i64 * 65_535 / i64::from((width - 1).max(1))) as i32;
     let normalized_y = ((target_y - top) as i64 * 65_535 / i64::from((height - 1).max(1))) as i32;
     send_mouse_input(
@@ -617,16 +627,29 @@ fn send_input(input: &Input) -> Result<(), String> {
     }
 }
 
+pub fn reset_injected_state() {}
+
 pub fn place_pointer(edge: Edge) -> Result<(), String> {
     let (left, top, width, height) = virtual_screen();
     let mut current = Point::default();
     unsafe { GetCursorPos(&mut current) };
-    let y = current.y.clamp(top + 24, top + height - 25);
-    let x = match edge {
-        Edge::Left => left + 8,
-        Edge::Right => left + width - 9,
-        Edge::Disabled => left + width / 2,
+    let min_y = top.saturating_add(24);
+    let max_y = top.saturating_add(height.saturating_sub(25));
+    let y = if min_y <= max_y {
+        safe_clamp_i32(current.y, min_y, max_y)
+    } else {
+        top.saturating_add(height / 2)
     };
+    let max_x = left.saturating_add(width.saturating_sub(1)).max(left);
+    let x = safe_clamp_i32(
+        match edge {
+            Edge::Left => left.saturating_add(8),
+            Edge::Right => left.saturating_add(width.saturating_sub(9)),
+            Edge::Disabled => left.saturating_add(width / 2),
+        },
+        left,
+        max_x,
+    );
     if unsafe { SetCursorPos(x, y) } != 0 {
         Ok(())
     } else {
