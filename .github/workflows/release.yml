@@ -21,7 +21,7 @@ jobs:
         include:
           - os: windows-latest
             artifact: DeskBridge-Windows-x64
-          - os: macos-14
+          - os: macos-latest
             artifact: DeskBridge-macOS-arm64
     runs-on: ${{ matrix.os }}
     steps:
